@@ -1,7 +1,7 @@
 import unittest
 
 from opendbc.car import DT_CTRL, structs
-from opendbc.car.body.carcontroller import MAX_ACCEL, MAX_DECEL, TORQUE_DEADBAND, CarController, rate_limit
+from opendbc.car.body.carcontroller import MAX_ACCEL, MAX_DECEL, MAX_SPEED_INTEGRATOR, TORQUE_DEADBAND, CarController, rate_limit
 from opendbc.car.body.interface import CarInterface
 from opendbc.car.body.values import CAR, SPEED_FROM_RPM
 
@@ -95,6 +95,53 @@ class TestBodyCarController(unittest.TestCase):
       torque_l, torque_r = self._step(CC, desired / SPEED_FROM_RPM / 2, -desired / SPEED_FROM_RPM / 2)
     self.assertLess(torque_l, 0)       # positive turn axis asks for left slower than right
     self.assertGreater(torque_r, 0)
+
+  def _drive(self, axis_speed: float, seconds: float, blocked_until: float = 0., gain: float = 0.032, lag: float = 0.15):
+    """A crude body driving straight: speed settles toward what the torque can hold, unless something blocks the wheels.
+
+    The gain is from a recorded drive (about 20 torque held 0.32 m/s once past the 10 of friction).
+    Returns (time, speed, torque) samples.
+    """
+    CC = get_control(axis_speed=axis_speed)
+    speed, samples = 0., []
+    for i in range(int(seconds / DT_CTRL)):
+      t = i * DT_CTRL
+      rpm = speed / SPEED_FROM_RPM
+      torque_l, torque_r = self._step(CC, rpm, rpm)
+      torque = (torque_l + torque_r) / 2.
+      if t < blocked_until:
+        speed = 0.
+      else:
+        drive = max(0., abs(torque) - TORQUE_DEADBAND) * (1 if torque > 0 else -1)
+        speed += (drive * gain - speed) * DT_CTRL / lag
+      samples.append((t, speed, torque))
+    return samples
+
+  def test_pushes_through_a_stall(self):
+    # wheels blocked while asked for 0.3 m/s: torque keeps building instead of sitting at a few dozen
+    samples = self._drive(0.375, 3., blocked_until=3.)
+    torque_at = {round(t, 2): torque for t, _, torque in samples}
+    self.assertGreater(torque_at[1.0], 80)
+    self.assertGreater(torque_at[2.99], 200)
+    # but the stored push is limited
+    self.assertLessEqual(abs(self.CI.CC.wheeled_speed_pid.i), MAX_SPEED_INTEGRATOR + 1.)
+
+  def test_does_not_leap_after_the_stall(self):
+    # blocked for three seconds, then free: it may surge, but briefly, and then settles at the asked speed
+    samples = self._drive(0.375, 8., blocked_until=3.)
+    after = [(t, speed) for t, speed, _ in samples if t >= 3.]
+    self.assertLess(max(speed for _, speed in after), 1.5)
+    too_fast = [t for t, speed in after if speed > 0.6]
+    self.assertLess(len(too_fast) * DT_CTRL, 0.6)
+    for _, speed in after[-100:]:
+      self.assertAlmostEqual(speed, 0.3, delta=0.03)
+
+  def test_drives_steadily_without_a_stall(self):
+    samples = self._drive(0.375, 4.)
+    speeds = [speed for _, speed, _ in samples]
+    self.assertLess(max(speeds), 0.34)   # no overshoot worth the name
+    for speed in speeds[-100:]:
+      self.assertAlmostEqual(speed, 0.3, delta=0.01)
 
   def test_disabled_resets(self):
     CC = get_control(axis_speed=1.)

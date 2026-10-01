@@ -10,8 +10,14 @@ from opendbc.car.interfaces import CarControllerBase
 MAX_TORQUE = 500
 MAX_TORQUE_RATE = 50
 MAX_ANGLE_ERROR = np.radians(7)
-MAX_POS_INTEGRATOR = 0.2   # meters
-MAX_TURN_INTEGRATOR = 0.5  # meters
+# the integrators are what push through a stall (a door sill, a rug, a wheel that drags): when the
+# body isn't moving as asked, torque keeps building until it does. measured before this: stalled at a
+# small bump the speed integrator added 3.5 torque a second, so it never got near what the motors can do,
+# and one wheel barely turned in reverse. the limits keep the stored push small enough that the body
+# doesn't leap forward once it gets over
+MAX_SPEED_INTEGRATOR = 180.  # torque
+MAX_TURN_INTEGRATOR = 120.   # torque
+INTEGRATOR_UNWIND = 3.       # the stored push is given back this much faster than it builds
 
 # torque applied up front for the speed that's asked for, instead of waiting for an error to build.
 # measured on training wheels: asked for a 0.38 m/s wheel speed difference it only reached 0.18,
@@ -43,8 +49,8 @@ class CarController(CarControllerBase):
     self.packer = CANPacker(dbc_names[Bus.main])
 
     # PIDs
-    self.turn_pid = PIDController(110, k_i=25., k_f=TURN_FEEDFORWARD, rate=1 / DT_CTRL)
-    self.wheeled_speed_pid = PIDController(110, k_i=11.5, k_f=SPEED_FEEDFORWARD, rate=1 / DT_CTRL)
+    self.turn_pid = PIDController(110, k_i=100., k_f=TURN_FEEDFORWARD, rate=1 / DT_CTRL)
+    self.wheeled_speed_pid = PIDController(160, k_i=200., k_f=SPEED_FEEDFORWARD, rate=1 / DT_CTRL)
 
     self.speed_desired = 0.
     self.speed_diff_desired = 0.
@@ -56,6 +62,15 @@ class CarController(CarControllerBase):
     # fade the compensation in around zero. a hard +/- deadband flips sign with
     # the noise when the torque is near zero, which chatters the motors at rest
     return torque + deadband * float(np.clip(torque / TORQUE_DEADBAND_BLEND, -1., 1.))
+
+  @staticmethod
+  def update_pid(pid, error, feedforward, max_integrator):
+    # stop building once the integrator holds as much push as it's allowed
+    freeze = abs(pid.i) >= max_integrator and error * pid.i > 0
+    # and give the push back quickly once the error turns around (it got over the bump)
+    if error * pid.i < 0:
+      pid.i += (INTEGRATOR_UNWIND - 1.) * error * pid.k_i * DT_CTRL
+    return pid.update(error, feedforward=feedforward, freeze_integrator=freeze)
 
   def update(self, CC, CS, now_nanos):
 
@@ -71,14 +86,12 @@ class CarController(CarControllerBase):
       speed_measured = SPEED_FROM_RPM * (CS.out.wheelSpeeds.fl + CS.out.wheelSpeeds.fr) / 2.
       speed_error = self.speed_desired - speed_measured
 
-      torque = self.wheeled_speed_pid.update(speed_error, feedforward=self.speed_desired, freeze_integrator=False)
+      torque = self.update_pid(self.wheeled_speed_pid, speed_error, self.speed_desired, MAX_SPEED_INTEGRATOR)
 
       speed_diff_measured = SPEED_FROM_RPM * (CS.out.wheelSpeeds.fl - CS.out.wheelSpeeds.fr)
       turn_error = speed_diff_measured - self.speed_diff_desired
-      freeze_integrator = ((turn_error < 0 and self.turn_pid.error_integral <= -MAX_TURN_INTEGRATOR) or
-                           (turn_error > 0 and self.turn_pid.error_integral >= MAX_TURN_INTEGRATOR))
       # the turn error is measured minus desired, so its feedforward has the opposite sign
-      torque_diff = self.turn_pid.update(turn_error, feedforward=-self.speed_diff_desired, freeze_integrator=freeze_integrator)
+      torque_diff = self.update_pid(self.turn_pid, turn_error, -self.speed_diff_desired, MAX_TURN_INTEGRATOR)
 
       # Combine 2 PIDs outputs
       torque_r = torque + torque_diff
