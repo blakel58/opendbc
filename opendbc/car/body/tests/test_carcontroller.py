@@ -64,6 +64,38 @@ class TestBodyCarController(unittest.TestCase):
       self.assertLess(abs(torque_l), TORQUE_DEADBAND / 2)
       self.assertLess(abs(torque_r), TORQUE_DEADBAND / 2)
 
+  def _spin(self, steps: int, friction: float, viscous: float):
+    """A crude body on training wheels turning in place: each wheel needs `friction` torque to move at all."""
+    CC = get_control(axis_turn=0.75)
+    rpm_l = rpm_r = 0.
+    for _ in range(steps):
+      torque_l, torque_r = self._step(CC, rpm_l, rpm_r)
+      for name, torque in (("l", torque_l), ("r", torque_r)):
+        rpm = rpm_l if name == "l" else rpm_r
+        drive = max(0., abs(torque) - friction) * (1 if torque > 0 else -1)
+        rpm += (drive / viscous - rpm) * 0.05   # settles toward the speed the leftover torque can hold
+        if name == "l":
+          rpm_l = rpm
+        else:
+          rpm_r = rpm
+    return SPEED_FROM_RPM * (rpm_l - rpm_r), self.CI.CC.speed_diff_desired
+
+  def test_turns_as_much_as_asked_despite_friction(self):
+    # friction like the recorded drive: the proportional term alone stalled at about half the asked turn
+    diff, desired = self._spin(400, friction=25., viscous=0.35)
+    self.assertAlmostEqual(abs(desired), 0.375)
+    self.assertGreater(diff / desired, 0.85)
+    self.assertLess(diff / desired, 1.15)   # and doesn't overshoot
+
+  def test_turn_feedforward_has_the_right_sign(self):
+    # with the wheels already at the asked difference there's no error, yet torque is still applied to hold it
+    CC = get_control(axis_turn=1.)
+    for _ in range(100):
+      desired = self.CI.CC.speed_diff_desired
+      torque_l, torque_r = self._step(CC, desired / SPEED_FROM_RPM / 2, -desired / SPEED_FROM_RPM / 2)
+    self.assertLess(torque_l, 0)       # positive turn axis asks for left slower than right
+    self.assertGreater(torque_r, 0)
+
   def test_disabled_resets(self):
     CC = get_control(axis_speed=1.)
     for _ in range(100):
