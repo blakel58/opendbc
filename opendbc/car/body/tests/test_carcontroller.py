@@ -51,7 +51,7 @@ class TestBodyCarController(unittest.TestCase):
     # full stick from rest: torque builds gradually instead of jumping to ~100
     CC = get_control(axis_speed=1.)
     torques = [self._step(CC)[0] for _ in range(10)]
-    self.assertLess(abs(torques[-1]), 30)
+    self.assertLess(abs(torques[-1]), 45)
     for prev, cur in zip(torques, torques[1:], strict=False):
       self.assertLess(abs(cur - prev), 10)
 
@@ -142,6 +142,52 @@ class TestBodyCarController(unittest.TestCase):
     self.assertLess(max(speeds), 0.34)   # no overshoot worth the name
     for speed in speeds[-100:]:
       self.assertAlmostEqual(speed, 0.3, delta=0.01)
+
+  def _sticky_spin(self, seconds: float, breakaway_l: float, breakaway_r: float = 40., axis_turn: float = 0.36):
+    """Turning on the spot with wheels that need more torque to start than to keep going, like the recorded one.
+
+    Once moving, a wheel settles toward what the torque beyond 15 can hold (25 held 0.2 m/s in the recording).
+    Returns (time, left speed, right speed, left torque, right torque) samples, speeds in m/s.
+    """
+    CC = get_control(axis_turn=axis_turn)
+    speed = {"l": 0., "r": 0.}
+    moving = {"l": False, "r": False}
+    samples = []
+    for i in range(int(seconds / DT_CTRL)):
+      torque_l, torque_r = self._step(CC, speed["l"] / SPEED_FROM_RPM, speed["r"] / SPEED_FROM_RPM)
+      for name, torque, breakaway in (("l", torque_l, breakaway_l), ("r", torque_r, breakaway_r)):
+        if not moving[name] and abs(torque) > breakaway:
+          moving[name] = True
+        if moving[name]:
+          target = max(0., abs(torque) - 15.) * 0.02 * (1 if torque > 0 else -1)
+          speed[name] += (target - speed[name]) * DT_CTRL / 0.15
+          if abs(speed[name]) < 0.005 and abs(torque) < 15.:
+            moving[name], speed[name] = False, 0.
+      samples.append((i * DT_CTRL, speed["l"], speed["r"], torque_l, torque_r))
+    return samples
+
+  def test_breaks_a_stuck_wheel_free_quickly(self):
+    # one wheel needs 65 to start (it took 1.4 s to get there by integrating alone)
+    samples = self._sticky_spin(3., breakaway_l=65.)
+    started = next(t for t, left, _, _, _ in samples if abs(left) > 0.03)
+    self.assertLess(started, 0.5)
+
+  def test_does_not_lurch_once_the_wheel_is_free(self):
+    samples = self._sticky_spin(4., breakaway_l=65.)
+    desired = abs(self.CI.CC.speed_diff_desired) / 2.   # each wheel's share
+    self.assertGreater(desired, 0.05)
+    left = [abs(left) for _, left, _, _, _ in samples]
+    self.assertLess(max(left), 2.2 * desired)
+    for speed in left[-100:]:
+      self.assertAlmostEqual(speed, desired, delta=0.35 * desired)
+    # and the extra torque is gone once it moves
+    self.assertLess(abs(self.CI.CC.kick_l), 2.)
+
+  def test_no_extra_torque_when_nothing_is_asked(self):
+    CC = get_control()
+    for _ in range(200):
+      self._step(CC, 0., 0.)
+    self.assertEqual((self.CI.CC.kick_l, self.CI.CC.kick_r), (0., 0.))
 
   def test_disabled_resets(self):
     CC = get_control(axis_speed=1.)
